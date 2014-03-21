@@ -14,8 +14,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"time"
 )
 
 // Scrapinghub Base API URL
@@ -118,6 +121,22 @@ func (conn *Connection) PostFiles(rurl string, params map[string][]string, files
 	return conn.client.Do(req)
 }
 
+// Build the full API URL using the connection.BaseUrl, the `method` to query and
+// all the parameters `params`.
+// Returns the full url processed and an error if exist
+func build_api_url(conn *Connection, method string, params *url.Values) (string, error) {
+	query_url, err := url.Parse(conn.BaseUrl)
+	if err != nil {
+		return "", err
+	}
+	query_url.Path = path.Join(query_url.Path, method)
+	query_url.RawQuery, err = url.QueryUnescape(params.Encode())
+	if err != nil {
+		return "", err
+	}
+	return query_url.String(), nil
+}
+
 type Spiders struct {
 	Spiders []map[string]string
 	Status  string
@@ -131,8 +150,13 @@ var (
 )
 
 func (spider *Spiders) List(conn *Connection, project_id string) (*Spiders, error) {
-	method := "/spiders/list.json?project=" + project_id
-	resp, err := conn.Get(conn.BaseUrl + method)
+	params := url.Values{}
+	params.Add("project", project_id)
+	query_url, err := build_api_url(conn, "/spiders/list.json", &params)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := conn.Get(query_url)
 	if err != nil {
 		return nil, err
 	}
@@ -179,11 +203,19 @@ type Jobs struct {
 // Returns the list of Jobs for project_id limited by count and those which
 // match the filters
 func (jobs *Jobs) List(conn *Connection, project_id string, count int, filters map[string]string) (*Jobs, error) {
-	method := fmt.Sprintf("/jobs/list.json?project=%s&count=%d", project_id, count)
-	for fname, fval := range filters {
-		method = fmt.Sprintf("%s&%s=%s", method, fname, fval)
+	params := url.Values{}
+	params.Add("project", project_id)
+	if count > 0 {
+		params.Add("count", strconv.Itoa(count))
 	}
-	resp, err := conn.Get(conn.BaseUrl + method)
+	for fname, fval := range filters {
+		params.Add(fname, fval)
+	}
+	query_url, err := build_api_url(conn, "/jobs/list.json", &params)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := conn.Get(query_url)
 	if err != nil {
 		return nil, err
 	}
@@ -208,8 +240,14 @@ func (jobs *Jobs) JobInfo(conn *Connection, job_id string) (*Job, error) {
 	}
 	project_id := result[1]
 
-	method := fmt.Sprintf("/jobs/list.json?project=%s&job=%s", project_id, job_id)
-	resp, err := conn.Get(conn.BaseUrl + method)
+	params := url.Values{}
+	params.Add("project", project_id)
+	params.Add("job_id", job_id)
+	query_url, err := build_api_url(conn, "/jobs/list.json", &params)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := conn.Get(query_url)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +263,6 @@ func (jobs *Jobs) JobInfo(conn *Connection, job_id string) (*Job, error) {
 	if len(jobs.Jobs) <= 0 {
 		return nil, errors.New(fmt.Sprintf("Jobs.JobInfo: Job %s does not exist", job_id))
 	}
-
 	return &jobs.Jobs[0], nil
 }
 
@@ -349,9 +386,18 @@ func RetrieveItems(conn *Connection, job_id string, count, offset int) ([]map[st
 	}
 	project_id := result[1]
 
-	method := fmt.Sprintf("/items.json?project=%s&job=%s&count=%d&offset=%d", project_id, job_id, count, offset)
-
-	resp, err := conn.Get(conn.BaseUrl + method)
+	params := url.Values{}
+	params.Add("project", project_id)
+	params.Add("job", job_id)
+	params.Add("offset", strconv.Itoa(offset))
+	if count > 0 {
+		params.Add("count", strconv.Itoa(count))
+	}
+	query_url, err := build_api_url(conn, "/items.json", &params)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := conn.Get(query_url)
 	if err != nil {
 		return nil, err
 	}
@@ -403,75 +449,137 @@ func RetrieveSlybotProject(conn *Connection, project_id string, spiders []string
 	return nil
 }
 
-func retrieveLinesStream(conn *Connection, method string) (<-chan string, error) {
-	resp, err := conn.Get(conn.BaseUrl + method)
-	if err != nil {
-		return nil, err
-	}
-	ch := make(chan string)
+// Retrieve an stream of lines from the connection `conn` and to API method `method`. `count`
+// and `offset` parameters are availble to jump to any place of the stream (counting lines)
+// on the position `offset`.
+// It behaves reliable when the connection drops or when the API is not available.
+func retrieveLinesStream(conn *Connection, method string, params *url.Values, count, offset int) (<-chan string, <-chan error) {
+	const (
+		BATCH_SIZE     = 1000
+		MAX_RETRIES    = 3
+		RETRY_INTERVAL = time.Second * 30
+	)
+
+	var in_count int = BATCH_SIZE
+	out := make(chan string)
+	errch := make(chan error)
 
 	go func() {
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			ch <- scanner.Text()
+		defer close(out)
+		defer close(errch)
+
+		for {
+			if count < BATCH_SIZE {
+				in_count = count
+			}
+			params.Set("offset", strconv.Itoa(offset))
+			if in_count > 0 {
+				params.Set("count", strconv.Itoa(in_count))
+			}
+			query_url, err := build_api_url(conn, method, params)
+			if err != nil {
+				close(out)
+				errch <- err
+			}
+			resp, err := conn.Get(query_url)
+			if err != nil {
+				i := 0
+				for (err != nil || resp.StatusCode >= 400) && i < MAX_RETRIES {
+					time.Sleep(RETRY_INTERVAL)
+					resp, err = conn.Get(query_url)
+					i++
+				}
+				if i == MAX_RETRIES && err != nil {
+					close(out)
+					errch <- err
+				}
+			}
+			scanner := bufio.NewScanner(resp.Body)
+			retrieved := 0
+			for scanner.Scan() {
+				retrieved++
+				out <- scanner.Text()
+			}
+			if scanner.Err() != nil {
+				if retrieved == 0 && count > 0 {
+					close(out)
+					errch <- scanner.Err()
+				}
+				offset += retrieved
+				count -= retrieved
+			} else {
+				offset += in_count
+				count -= in_count
+			}
+			if count <= 0 {
+				break
+			}
 		}
-		close(ch)
 	}()
-	return ch, nil
+	return out, errch
+}
+
+// Helper method that check for job_id format, build the method using
+// `project_id` extracted from `job_id` plus `job_id`.
+// Is to avoid repeate the same code every time.
+func asLineStream(conn *Connection, method string, params *url.Values, job_id string, count, offset int) (<-chan string, <-chan error) {
+	result := re_jobid.FindStringSubmatch(job_id)
+	if len(result) == 0 {
+		errch := make(chan error)
+		go func() {
+			defer close(errch)
+			errch <- wrong_job_id_error
+		}()
+		return nil, errch
+	}
+	project_id := result[1]
+
+	params.Set("project", project_id)
+	params.Set("job", job_id)
+
+	return retrieveLinesStream(conn, method, params, count, offset)
+
 }
 
 //  Given a job_id, returns a channel of strings where each element is a line of
 //  the JsonLines returned by the API items.jl endpoint.
-func ItemsAsJsonLines(conn *Connection, job_id string, count, offset int) (<-chan string, error) {
-	result := re_jobid.FindStringSubmatch(job_id)
-	if len(result) == 0 {
-		return nil, wrong_job_id_error
-	}
-	project_id := result[1]
-	method := fmt.Sprintf("/items.jl?project=%s&job=%s&count=%d&offset=%d", project_id, job_id, count, offset)
-
-	return retrieveLinesStream(conn, method)
+//  Returns a channel with errors
+func ItemsAsJsonLines(conn *Connection, job_id string, count, offset int) (<-chan string, <-chan error) {
+	return asLineStream(conn, "items.jl", &url.Values{}, job_id, count, offset)
 }
 
 //  Given a job_id, returns a channel of strings where each element is a line of
 //  the CSV returned by the API items.csv endpoint.
-func ItemsAsCSV(conn *Connection, job_id string, count, offset int, include_headers bool, fields string) (<-chan string, error) {
-	result := re_jobid.FindStringSubmatch(job_id)
-	if len(result) == 0 {
-		return nil, wrong_job_id_error
-	}
-	project_id := result[1]
-	var iih int = 0
+//  Returns a channel with errors
+func ItemsAsCSV(conn *Connection, job_id string, count, offset int, include_headers bool, fields string) (<-chan string, <-chan error) {
+	iih := 0
 	if include_headers {
 		iih = 1
 	}
-	method := fmt.Sprintf("/items.csv?project=%s&job=%s&include_headers=%d&fields=%s&count=%d&offset=%d", project_id, job_id, iih, fields, count, offset)
+	params := url.Values{}
+	params.Add("include_headers", strconv.Itoa(iih))
+	params.Add("fields", fields)
+	return asLineStream(conn, "items.csv", &params, job_id, count, offset)
+}
 
-	return retrieveLinesStream(conn, method)
+// Returns a channel of strings which each element is a line of the log for job with `job_id`
+// Count and offset parameters are accepted to paginate results.
+//  Returns a channel with errors
+func LogLines(conn *Connection, job_id string, count, offset int) (<-chan string, <-chan error) {
+	return asLineStream(conn, "log.txt", &url.Values{}, job_id, count, offset)
 }
 
 // Returns a channel of strings which each element is a JSON serialized job for
 // the project `project_id`. `count` and filters (a list of string of the type
 // key=value to apply to the result (see http://doc.scrapinghub.com/api.html#jobs-list-json)
-func JobsAsJsonLines(conn *Connection, project_id string, count int, filters map[string]string) (<-chan string, error) {
-	method := fmt.Sprintf("/jobs/list.jl?project=%s&count=%d", project_id, count)
+//  Returns a channel with errors
+func JobsAsJsonLines(conn *Connection, project_id string, count, offset int, filters map[string]string) (<-chan string, <-chan error) {
+	params := url.Values{}
+	params.Add("project", project_id)
 	for fname, fval := range filters {
-		method = fmt.Sprintf("%s&%s=%s", method, fname, fval)
+		params.Add(fname, fval)
 	}
-	return retrieveLinesStream(conn, method)
-}
-
-// Returns a channel of strings which each element is a line of the log for job with `job_id`
-// Count and offset parameters are accepted to paginate results.
-func LogLines(conn *Connection, job_id string, count, offset int) (<-chan string, error) {
-	result := re_jobid.FindStringSubmatch(job_id)
-	if len(result) == 0 {
-		return nil, wrong_job_id_error
-	}
-	project_id := result[1]
-	method := fmt.Sprintf("/log.txt?project=%s&job=%s&count=%d&offset=%d", project_id, job_id, count, offset)
-
-	return retrieveLinesStream(conn, method)
+	return retrieveLinesStream(conn, "/jobs/list.jl", &params, count, offset)
 }
 
 /*
