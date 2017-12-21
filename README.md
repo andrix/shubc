@@ -1,3 +1,5 @@
+**Note: This repository is no longer maintained, and may not be current with the Scrapinghub API.**
+
 Scrapinghub API Go library
 ==========================
 
